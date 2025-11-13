@@ -1,4 +1,5 @@
 (define-map escrows uint { buyer: principal, seller: principal, arbitrator: principal, amount: uint, state: uint, created-at: uint, timeout-blocks: uint })
+(define-map timeout-extensions uint { proposed-timeout: uint, buyer-approved: bool, seller-approved: bool })
 ;; states: 0 = funded, 1 = released, 2 = disputed, 3 = expired
 
 ;; Error codes
@@ -35,6 +36,20 @@
 
 (define-private (is-escrow-expired (escrow-data {buyer: principal, seller: principal, arbitrator: principal, amount: uint, state: uint, created-at: uint, timeout-blocks: uint}))
   (> stacks-block-height (+ (get created-at escrow-data) (get timeout-blocks escrow-data))))
+
+(define-private (is-timeout-adjustable (escrow-data {buyer: principal, seller: principal, arbitrator: principal, amount: uint, state: uint, created-at: uint, timeout-blocks: uint}))
+  (or (is-eq (get state escrow-data) u0) (is-eq (get state escrow-data) u2)))
+
+(define-private (update-escrow (id uint) (current {buyer: principal, seller: principal, arbitrator: principal, amount: uint, state: uint, created-at: uint, timeout-blocks: uint}) (new-state (optional uint)) (new-timeout (optional uint)))
+  (map-set escrows id {
+    buyer: (get buyer current),
+    seller: (get seller current),
+    arbitrator: (get arbitrator current),
+    amount: (get amount current),
+    state: (default-to (get state current) new-state),
+    created-at: (get created-at current),
+    timeout-blocks: (default-to (get timeout-blocks current) new-timeout)
+  }))
 
 ;; Enhanced create-escrow with optional timeout parameter
 (define-public (create-escrow (id uint) (seller principal) (arb principal) (amount uint))
@@ -76,30 +91,19 @@
     ;; Validate input
     (asserts! (is-valid-id id) (err ERR-INVALID-ID))
     
-    (let ((e (map-get? escrows id)))
-      (match e
-        val
-          (begin
-            ;; Check if escrow is in funded state
-            (asserts! (is-eq (get state val) u0) (err ERR-INVALID-STATE))
-            ;; Only buyer or arbitrator can release funds
-            (asserts! (or (is-eq tx-sender (get buyer val)) 
-                         (is-eq tx-sender (get arbitrator val))) 
-                     (err ERR-UNAUTHORIZED))
-            ;; Transfer funds from contract to seller
-            (try! (as-contract (stx-transfer? (get amount val) tx-sender (get seller val))))
-            ;; Update escrow state to released
-            (map-set escrows id { 
-              buyer: (get buyer val), 
-              seller: (get seller val), 
-              arbitrator: (get arbitrator val), 
-              amount: (get amount val), 
-              state: u1,
-              created-at: (get created-at val),
-              timeout-blocks: (get timeout-blocks val)
-            })
-            (ok true))
-        (err ERR-NOT-FOUND)))))
+    (match (map-get? escrows id)
+      val
+        (begin
+          ;; Check if escrow is in funded state
+          (asserts! (is-eq (get state val) u0) (err ERR-INVALID-STATE))
+          ;; Only buyer can release funds
+          (asserts! (is-eq tx-sender (get buyer val)) (err ERR-UNAUTHORIZED))
+          ;; Transfer funds from contract to seller
+          (try! (as-contract (stx-transfer? (get amount val) tx-sender (get seller val))))
+          ;; Update escrow state to released
+          (update-escrow id val (some u1) none)
+          (ok true))
+      (err ERR-NOT-FOUND))))
 
 (define-public (dispute (id uint))
   (begin
@@ -117,15 +121,7 @@
                          (is-eq tx-sender (get seller val))) 
                      (err ERR-UNAUTHORIZED))
             ;; Update escrow state to disputed
-            (map-set escrows id { 
-              buyer: (get buyer val), 
-              seller: (get seller val), 
-              arbitrator: (get arbitrator val), 
-              amount: (get amount val), 
-              state: u2,
-              created-at: (get created-at val),
-              timeout-blocks: (get timeout-blocks val)
-            })
+            (update-escrow id val (some u2) none)
             (ok true))
         (err ERR-NOT-FOUND)))))
 
@@ -147,15 +143,7 @@
               (try! (as-contract (stx-transfer? (get amount val) tx-sender (get seller val))))
               (try! (as-contract (stx-transfer? (get amount val) tx-sender (get buyer val)))))
             ;; Update escrow state to released
-            (map-set escrows id { 
-              buyer: (get buyer val), 
-              seller: (get seller val), 
-              arbitrator: (get arbitrator val), 
-              amount: (get amount val), 
-              state: u1,
-              created-at: (get created-at val),
-              timeout-blocks: (get timeout-blocks val)
-            })
+            (update-escrow id val (some u1) none)
             (ok true))
         (err ERR-NOT-FOUND)))))
 
@@ -176,17 +164,65 @@
             ;; Refund to buyer
             (try! (as-contract (stx-transfer? (get amount val) tx-sender (get buyer val))))
             ;; Update state to expired
-            (map-set escrows id { 
-              buyer: (get buyer val), 
-              seller: (get seller val), 
-              arbitrator: (get arbitrator val), 
-              amount: (get amount val), 
-              state: u3,
-              created-at: (get created-at val),
-              timeout-blocks: (get timeout-blocks val)
+            (update-escrow id val (some u3) none)
+            (ok true))
+        (err ERR-NOT-FOUND)))))
+
+;; Timeout extension workflow
+(define-public (propose-timeout-extension (id uint) (new-timeout uint))
+  (begin
+    (asserts! (is-valid-id id) (err ERR-INVALID-ID))
+    (asserts! (is-valid-timeout new-timeout) (err ERR-INVALID-TIMEOUT))
+    (let ((e (map-get? escrows id)))
+      (match e
+        escrow
+          (let (
+                (is-buyer (is-eq tx-sender (get buyer escrow)))
+                (is-seller (is-eq tx-sender (get seller escrow)))
+               )
+            (asserts! (or is-buyer is-seller) (err ERR-UNAUTHORIZED))
+            (asserts! (is-timeout-adjustable escrow) (err ERR-INVALID-STATE))
+            (asserts! (> new-timeout (get timeout-blocks escrow)) (err ERR-INVALID-TIMEOUT))
+            (map-set timeout-extensions id {
+              proposed-timeout: new-timeout,
+              buyer-approved: is-buyer,
+              seller-approved: is-seller
             })
             (ok true))
         (err ERR-NOT-FOUND)))))
+
+(define-public (approve-timeout-extension (id uint))
+  (begin
+    (asserts! (is-valid-id id) (err ERR-INVALID-ID))
+    (match (map-get? escrows id)
+      escrow
+        (begin
+          (asserts! (is-timeout-adjustable escrow) (err ERR-INVALID-STATE))
+          (match (map-get? timeout-extensions id)
+            ext
+              (let (
+                    (is-buyer (is-eq tx-sender (get buyer escrow)))
+                    (is-seller (is-eq tx-sender (get seller escrow)))
+                   )
+                (asserts! (or is-buyer is-seller) (err ERR-UNAUTHORIZED))
+                (let (
+                      (next-buyer (or (get buyer-approved ext) is-buyer))
+                      (next-seller (or (get seller-approved ext) is-seller))
+                     )
+                  (map-set timeout-extensions id {
+                    proposed-timeout: (get proposed-timeout ext),
+                    buyer-approved: next-buyer,
+                    seller-approved: next-seller
+                  })
+                  (if (and next-buyer next-seller)
+                    (begin
+                      (update-escrow id escrow none (some (get proposed-timeout ext)))
+                      (map-delete timeout-extensions id)
+                      (ok true))
+                    (ok true))))
+            (err ERR-NOT-FOUND)))
+      (err ERR-NOT-FOUND)))
+  )
 
 ;; Read-only function to get escrow details
 (define-read-only (get-escrow (id uint))
